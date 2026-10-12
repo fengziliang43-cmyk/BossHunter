@@ -90,6 +90,101 @@ class WebApiRouteTests(unittest.TestCase):
         # Cleanup
         server.set_base_dir(self.original_base_dir)
 
+    def test_outsourcing_rules_refresh_old_jobs_in_every_review_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, {**_job("outsourcing-review"), "company": "测试供应商"})
+                update_job_score(db, "outsourcing-review", 85, "synthetic score")
+                update_job_status(db, "outsourcing-review", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            paths = {
+                "/api/jobs": lambda payload: payload[0],
+                "/api/jobs/search": lambda payload: payload["items"][0],
+                "/api/jobs/outsourcing-review": lambda payload: payload,
+                "/api/workbench": lambda payload: payload["pending_confirmation"][0],
+            }
+            versions = []
+            for enabled, expected in ((True, "confirmed"), (False, "clean")):
+                (base_dir / "config.yaml").write_text(yaml.safe_dump({
+                    "outsourcing_rules": {"companies_user": ["测试供应商"], "enabled": enabled},
+                }), encoding="utf-8")
+                for path, get_record in paths.items():
+                    with self.subTest(enabled=enabled, path=path):
+                        status, _, body = self._request(path)
+                        self.assertTrue(status.startswith("200"), body)
+                        record = get_record(json.loads(body))
+                        self.assertEqual(record["outsourcing_level"], expected)
+                        self.assertEqual(record["outsourcing_confirmed"], enabled)
+                        self.assertIsInstance(record["outsourcing_matches"], list)
+                        self.assertEqual(record["status"], "ready")
+                versions.append(record["outsourcing_rules_version"])
+            self.assertNotEqual(*versions)
+
+    def test_bad_outsourcing_json_cannot_break_job_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("malformed-outsourcing"))
+                server.set_base_dir(base_dir)
+                for raw in ("1", "null", "{}", '[{"keyword":{}}]'):
+                    db.execute("UPDATE jobs SET outsourcing_matches=?,outsourcing_layers=?", (raw, raw))
+                    db.commit()
+                    status, _, body = self._request("/api/jobs/malformed-outsourcing")
+                    self.assertTrue(status.startswith("200"), body)
+                    record = json.loads(body)
+                    self.assertEqual(record["outsourcing_matches"], [])
+                    self.assertEqual(record["outsourcing_layers"], [])
+            finally:
+                db.close()
+
+    def test_outsourcing_and_greeting_metadata_coexist_across_review_apis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, {**_job("outsourcing-greeting"), "company": "中软国际有限公司"})
+                update_job_status(db, "outsourcing-greeting", "ready")
+                save_generated_greeting_preview(
+                    db, "outsourcing-greeting", original="原始招呼语", optimized="优化招呼语",
+                    style_issues=["表达可以更简洁"], selected_greeting="原始招呼语", selection="pending",
+                )
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            paths = {
+                "/api/jobs": lambda payload: payload[0],
+                "/api/jobs/search": lambda payload: payload["items"][0],
+                "/api/jobs/outsourcing-greeting": lambda payload: payload,
+                "/api/workbench": lambda payload: payload["pending_greetings"][0],
+            }
+            with server.greeting_activity.claim("outsourcing-greeting", "editing"):
+                for path, get_record in paths.items():
+                    with self.subTest(path=path):
+                        status, _, body = self._request(path)
+                        self.assertTrue(status.startswith("200"), body)
+                        record = get_record(json.loads(body))
+                        self.assertEqual(record["outsourcing_level"], "confirmed")
+                        self.assertIs(record["outsourcing_confirmed"], True)
+                        self.assertIsInstance(record["outsourcing_matches"], list)
+                        self.assertEqual(record["greeting_style_issues"], ["表达可以更简洁"])
+                        self.assertEqual(record["greeting_activity"], "editing")
+                        self.assertEqual(record["greeting_selection"], "pending")
+            status, _, body = self._request(
+                "/api/jobs/outsourcing-greeting/greeting-selection", method="POST",
+                json_body={"selection": "optimized", "confirmed": True},
+            )
+            self.assertTrue(status.startswith("200"), body)
+            record = json.loads(body)
+            self.assertEqual(record["outsourcing_level"], "confirmed")
+            self.assertIsInstance(record["outsourcing_matches"], list)
+            self.assertEqual(record["greeting_selection"], "optimized")
+            self.assertEqual(record["greeting_style_issues"], ["表达可以更简洁"])
+
     def _request(self, path: str, method: str = "GET", json_body: dict | None = None, environ_overrides=None):
         if "?" in path:
             path_info, query_string = path.split("?", 1)
@@ -786,6 +881,173 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(payload["limit"], 15)
         self.assertEqual(payload["offset"], 0)
 
+    def test_job_search_hides_blocked_companies_before_pagination_without_deleting_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            config_path = base_dir / "config.yaml"
+            config_path.write_text(yaml.safe_dump({"profile": {"blocked_companies": ["  BLOCKED  "]}}))
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id, company, score, status_value in (
+                    ("blocked-high", "Blocked Technology", 99, "ready"),
+                    ("visible-high", "Visible A", 90, "ready"),
+                    ("blocked-middle", "Another blocked Company", 85, "ready"),
+                    ("visible-low", "Visible B", 80, "ready"),
+                    ("visible-filtered", "Visible C", 60, "filtered"),
+                    ("deleted", "Visible D", 95, "ready"),
+                ):
+                    insert_job(db, {**_job(job_id), "company": company})
+                    update_job_score(db, job_id, score, "匹配")
+                    update_job_status(db, job_id, status_value)
+                db.execute("UPDATE jobs SET deleted_at = datetime('now') WHERE id = 'deleted'")
+                db.commit()
+                before = [tuple(row) for row in db.execute("SELECT id, score, status, deleted_at FROM jobs ORDER BY id")]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            for offset, expected_id in ((0, "visible-high"), (1, "visible-low")):
+                status, _, body = self._request(f"/api/jobs/search?status=ready&sort_by=score&limit=1&offset={offset}")
+                self.assertTrue(status.startswith("200"), body)
+                payload = json.loads(body)
+                self.assertEqual([job["id"] for job in payload["items"]], [expected_id])
+                self.assertEqual(payload["total"], 2)
+                self.assertEqual(payload["all_total"], 3)
+
+            config_path.write_text(yaml.safe_dump({"profile": {"blocked_companies": []}}))
+            status, _, body = self._request("/api/jobs/search?status=ready&sort_by=score")
+            self.assertTrue(status.startswith("200"), body)
+            payload = json.loads(body)
+            self.assertEqual([job["id"] for job in payload["items"]], ["blocked-high", "visible-high", "blocked-middle", "visible-low"])
+            self.assertEqual(payload["total"], 4)
+            self.assertEqual(payload["all_total"], 5)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                self.assertEqual(
+                    [tuple(row) for row in db.execute("SELECT id, score, status, deleted_at FROM jobs ORDER BY id")], before
+                )
+            finally:
+                db.close()
+
+    def test_job_search_combines_blacklist_with_city_filters_and_pagination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text(yaml.safe_dump({"profile": {"blocked_companies": ["blocked"]}}))
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id, company, city, score in (
+                    ("blocked-sh", "Blocked Technology", "上海·浦东", 99),
+                    ("visible-sh", "Visible A", "上海·徐汇", 90),
+                    ("visible-bj", "Visible B", "北京", 80),
+                    ("outside-cities", "Visible C", "深圳", 70),
+                ):
+                    insert_job(db, {**_job(job_id), "company": company, "city": city, "title": "前端实习生"})
+                    update_job_score(db, job_id, score, "匹配")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            for offset, expected_id in ((0, "visible-sh"), (1, "visible-bj")):
+                status, _, body = self._request(
+                    f"/api/jobs/search?city={quote('上海')}&city={quote('北京')}&sort_by=score&limit=1&offset={offset}"
+                )
+                self.assertTrue(status.startswith("200"), body)
+                payload = json.loads(body)
+                self.assertEqual([job["id"] for job in payload["items"]], [expected_id])
+                self.assertEqual(payload["items"][0]["employment_type"], "internship")
+                self.assertEqual(payload["total"], 2)
+                self.assertEqual(payload["all_total"], 3)
+                self.assertCountEqual(payload["city_options"], ["上海", "北京", "深圳"])
+
+    def test_job_search_treats_blacklist_rules_as_literal_substrings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text(yaml.safe_dump({"profile": {"blocked_companies": ["100%", "_hold", " "]}}))
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id, company in (("percent", "100% Real"), ("underscore", "My_Holdings"), ("visible", "100x Real Holdings")):
+                    insert_job(db, {**_job(job_id), "company": company})
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            status, _, body = self._request("/api/jobs/search")
+            self.assertTrue(status.startswith("200"), body)
+            payload = json.loads(body)
+            self.assertEqual([job["id"] for job in payload["items"]], ["visible"])
+            self.assertEqual(payload["total"], 1)
+            self.assertEqual(payload["all_total"], 1)
+
+    def test_job_search_supports_repeated_multi_select_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                fixtures = [
+                    ("boss-ready", "boss", "experienced", "本科", "ready"),
+                    ("zhilian-filtered", "zhilian", "campus", "硕士", "filtered"),
+                    ("liepin-ready", "liepin", "experienced", "大专", "ready"),
+                ]
+                for job_id, platform, recruitment_type, education, status_value in fixtures:
+                    job = _job(job_id)
+                    job.update({"source_platform": platform, "recruitment_type": recruitment_type, "education": education})
+                    insert_job(db, job)
+                    update_job_status(db, job_id, status_value)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/search?source_platform=boss&source_platform=zhilian&"
+                "recruitment_type=experienced&recruitment_type=campus&status=ready&status=filtered"
+            )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertCountEqual([job["id"] for job in payload["items"]], ["zhilian-filtered", "boss-ready"])
+
+    def test_job_search_filters_by_city_and_reports_city_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id, city in (("sh", "Shanghai"), ("sh-pd", "Shanghai·Pudong"), ("bj", "Beijing"), ("blank", "")):
+                    job = _job(job_id)
+                    job["city"] = city
+                    insert_job(db, job)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search?city=Shanghai&city=Beijing")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertCountEqual([job["id"] for job in payload["items"]], ["sh", "sh-pd", "bj"])
+        self.assertCountEqual(payload["city_options"], ["Shanghai", "Beijing"])
+
+    def test_job_search_decodes_chinese_query_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                bachelor = _job("bachelor")
+                bachelor.update({"education": "本科", "city": "北京"})
+                insert_job(db, bachelor)
+                master = _job("master")
+                master.update({"education": "硕士", "city": "上海"})
+                insert_job(db, master)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                f"/api/jobs/search?education={quote('本科')}&city={quote('北京')}"
+            )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in payload["items"]], ["bachelor"])
+
     def test_job_search_salary_overlap_excludes_unparseable_and_paginates(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -1379,6 +1641,42 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(json.loads(workbench_body)["send_quota"]["sent"], 0)
         self.assertEqual(row["status"], "sent")
         self.assertEqual([item["action"] for item in history], ["manual_sent"])
+
+    def test_web_api_manual_status_updates_history_and_blocks_sent_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                ready = _job("manual-status-ready")
+                sent = _job("manual-status-sent")
+                insert_job(db, ready)
+                insert_job(db, sent)
+                update_job_status(db, sent["id"], "sent")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/status", method="POST",
+                json_body={"job_ids": [ready["id"]], "status": "skipped"},
+            )
+            blocked_status, _, blocked_body = self._request(
+                "/api/jobs/status", method="POST",
+                json_body={"job_ids": [sent["id"]], "status": "ready"},
+            )
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                row = verify_db.execute("SELECT status FROM jobs WHERE id = ?", (ready["id"],)).fetchone()
+                history = verify_db.execute("SELECT action, detail FROM history WHERE job_id = ?", (ready["id"],)).fetchall()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body)["affected_count"], 1)
+        self.assertTrue(blocked_status.startswith("409"), blocked_body)
+        self.assertEqual(row["status"], "skipped")
+        self.assertEqual(history[0]["action"], "status_changed")
+        self.assertIn("pending", history[0]["detail"])
 
     def test_web_api_cities_returns_bundled_liepin_snapshot(self):
         status, _, body = self._request("/api/cities?platform=liepin")

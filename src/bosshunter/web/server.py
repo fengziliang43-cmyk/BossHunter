@@ -5,6 +5,8 @@ Serves:
 - /* → Frontend static files (dist/)
 """
 
+from bosshunter.employment import classify_employment, internship_rejection
+
 import json
 from ipaddress import ip_address
 from urllib.parse import urlsplit
@@ -63,10 +65,13 @@ from bosshunter.db import (
 	persist_agent_evaluations,
 	reject_jobs,
 	restore_jobs,
+	serialize_job,
+	recompute_outsourcing,
 	select_job_greeting,
 	soft_delete_jobs,
 	edit_job_greeting,
 	update_job_status,
+	update_jobs_manual_status,
 )
 from bosshunter.collection.capabilities import platform_supports
 from bosshunter.collection.orchestrator import CollectionOrchestrator, normalize_collection_options
@@ -79,7 +84,7 @@ from bosshunter.collection_run_store import (
 	list_collection_runs,
 	mark_orphaned_collection_runs_stopped,
 )
-from bosshunter.job_filters import parse_monthly_salary_k
+from bosshunter.job_filters import city_base_name, city_match_clause, matching_blocked_company, parse_monthly_salary_k
 from bosshunter.job_export import InvalidJobSelectionError, export_jobs, export_row_count
 from bosshunter.scoring_run_store import (
 	create_scoring_run,
@@ -200,7 +205,15 @@ def set_base_dir(base_dir: Path | str) -> None:
 
 def _get_web_db():
 	"""Open the dashboard database from the resolved runtime data directory."""
-	return get_db(DATA_DIR / "bosshunter.db")
+	from bosshunter.outsourcing import load_rules
+
+	db = get_db(DATA_DIR / "bosshunter.db")
+	try:
+		recompute_outsourcing(db, load_rules(load_config(CONFIG_PATH)))
+		return db
+	except Exception:
+		db.close()
+		raise
 
 
 def _json_response(data, status_code=200):
@@ -228,9 +241,11 @@ def _serialize_history_items(items):
 	return serialized
 
 
-def _serialize_job(item):
-	"""Expose greeting style issues as a list while retaining DB compatibility."""
-	record = dict(item)
+def _serialize_job(item, *, config=None):
+	"""Expose outsourcing, employment, and greeting state in one API representation."""
+	record = serialize_job(dict(item))
+	record["employment_type"] = classify_employment(record)
+	record["employment_review"] = internship_rejection(record, config if config is not None else load_config(CONFIG_PATH))
 	record["greeting_activity"] = greeting_activity.get(str(record.get("id") or ""))
 	raw_issues = record.get("greeting_style_issues")
 	if isinstance(raw_issues, str):
@@ -1145,6 +1160,16 @@ def _score_trace_missing_state(job: dict) -> str:
 	return "unavailable"
 
 
+def _query_values(name: str) -> list[str]:
+	"""Read repeated query values while keeping the old single-value form valid.
+
+	``decode()`` is required: raw query values keep WSGI latin-1 bytes, so Chinese
+	filter values (学历、城市) would never match the database without it.
+	"""
+	values = request.query.decode().getall(name)
+	return [str(value).strip() for value in values if str(value).strip()]
+
+
 @app.route("/api/jobs/search")
 def api_job_search():
 	try:
@@ -1158,11 +1183,11 @@ def api_job_search():
 		created_within = request.params.get("created_within", "").strip()
 		if created_within and created_within not in {"today", "3d", "7d"}:
 			raise ValueError("created_within 参数无效")
-		recruitment_type = request.params.get("recruitment_type", "").strip()
-		if recruitment_type and recruitment_type not in {"campus", "experienced", "unknown"}:
+		recruitment_types = _query_values("recruitment_type")
+		if any(value not in {"campus", "experienced", "unknown"} for value in recruitment_types):
 			raise ValueError("recruitment_type 参数无效")
-		education_filter = (request.query.getunicode("education") or "").strip()
-		if education_filter and education_filter not in {"博士", "硕士", "本科", "大专", "不限", "其他", "unknown"}:
+		education_filters = _query_values("education")
+		if any(value not in {"博士", "硕士", "本科", "大专", "不限", "其他", "unknown"} for value in education_filters):
 			raise ValueError("education 参数无效")
 		sort_by = request.params.get("sort_by", "created_at").strip()
 		if sort_by not in {"salary", "education", "score", "status", "hr_active", "created_at"}:
@@ -1177,7 +1202,7 @@ def api_job_search():
 	conditions = ["deleted_at IS NULL"]
 	params = []
 	keyword = (request.query.getunicode("q") or "").strip()
-	status_filter = request.params.get("status", "").strip()
+	status_filters = _query_values("status")
 	if keyword:
 		conditions.append("(title LIKE ? OR company LIKE ? OR jd LIKE ? OR score_reason LIKE ?)")
 		keyword_param = f"%{keyword}%"
@@ -1185,24 +1210,35 @@ def api_job_search():
 	if minimum_score is not None:
 		conditions.append("score >= ?")
 		params.append(minimum_score)
-	if status_filter:
-		conditions.append("status = ?")
-		params.append(status_filter)
-	source_platform = request.params.get("source_platform", "").strip()
-	if source_platform:
-		if source_platform not in {"boss", "zhilian", "51job", "liepin"}:
+	if status_filters:
+		placeholders = ",".join("?" for _ in status_filters)
+		conditions.append(f"status IN ({placeholders})")
+		params.extend(status_filters)
+	source_platforms = _query_values("source_platform")
+	if source_platforms:
+		if any(value not in {"boss", "zhilian", "51job", "liepin"} for value in source_platforms):
 			return _json_response({"error": "source_platform 参数无效"}, 400)
-		conditions.append("COALESCE(source_platform, 'boss') = ?")
-		params.append(source_platform)
-	if recruitment_type:
-		conditions.append("COALESCE(recruitment_type, 'unknown') = ?")
-		params.append(recruitment_type)
-	if education_filter:
-		if education_filter == "unknown":
-			conditions.append("COALESCE(TRIM(education), '') = ''")
-		else:
-			conditions.append("education LIKE ?")
-			params.append(f"%{education_filter}%")
+		placeholders = ",".join("?" for _ in source_platforms)
+		conditions.append(f"COALESCE(source_platform, 'boss') IN ({placeholders})")
+		params.extend(source_platforms)
+	city_filters = _query_values("city")
+	if city_filters:
+		city_clause, city_params = city_match_clause(city_filters)
+		conditions.append(city_clause)
+		params.extend(city_params)
+	if recruitment_types:
+		placeholders = ",".join("?" for _ in recruitment_types)
+		conditions.append(f"COALESCE(recruitment_type, 'unknown') IN ({placeholders})")
+		params.extend(recruitment_types)
+	if education_filters:
+		education_conditions = []
+		for value in education_filters:
+			if value == "unknown":
+				education_conditions.append("COALESCE(TRIM(education), '') = ''")
+			else:
+				education_conditions.append("education LIKE ?")
+				params.append(f"%{value}%")
+		conditions.append(f"({' OR '.join(education_conditions)})")
 	if created_within == "today":
 		conditions.append("created_at >= datetime('now', 'localtime', 'start of day', 'utc')")
 	elif created_within == "3d":
@@ -1221,10 +1257,26 @@ def api_job_search():
 	}
 	query += f" ORDER BY {sort_expressions[sort_by]} {sort_order.upper()}, created_at DESC, score DESC"
 
+	config = load_config(CONFIG_PATH)
+	blocked_companies = config.get("profile", {}).get("blocked_companies", [])
 	db = _get_web_db()
 	try:
-		all_total = db.execute("SELECT COUNT(*) FROM jobs WHERE deleted_at IS NULL").fetchone()[0]
+		city_options = sorted({
+			city_base_name(row[0]) for row in db.execute(
+				"SELECT DISTINCT city FROM jobs"
+				" WHERE deleted_at IS NULL AND TRIM(COALESCE(city, '')) <> ''"
+			).fetchall()
+		})
+		if blocked_companies:
+			all_total = sum(
+				matching_blocked_company(row["company"], blocked_companies) is None
+				for row in db.execute("SELECT company FROM jobs WHERE deleted_at IS NULL")
+			)
+		else:
+			all_total = db.execute("SELECT COUNT(*) FROM jobs WHERE deleted_at IS NULL").fetchone()[0]
 		rows = [dict(row) for row in db.execute(query, params).fetchall()]
+		if blocked_companies:
+			rows = [row for row in rows if matching_blocked_company(row.get("company", ""), blocked_companies) is None]
 		if salary_min is not None or salary_max is not None:
 			filtered_rows = []
 			for row in rows:
@@ -1240,9 +1292,10 @@ def api_job_search():
 			rows = filtered_rows
 		total = len(rows)
 		return _json_response({
-			"items": rows[offset:offset + limit],
+			"items": [_serialize_job(row, config=config) for row in rows[offset:offset + limit]],
 			"total": total,
 			"all_total": all_total,
+			"city_options": city_options,
 			"limit": limit,
 			"offset": offset,
 		})
@@ -3154,6 +3207,23 @@ def api_jobs_manual_sent():
 		return _json_response(result)
 	except (ValueError, JobManualSentConflictError) as exc:
 		return _job_action_error(exc)
+	finally:
+		db.close()
+
+
+@app.route("/api/jobs/status", method="POST")
+def api_jobs_status():
+	db = _get_web_db()
+	try:
+		body, job_ids = _job_action_payload()
+		with job_mutation_lock:
+			conflict = _active_task_mutation_error()
+			if conflict is not None:
+				return conflict
+			result = update_jobs_manual_status(db, job_ids, str(body.get("status") or ""))
+		return _json_response(result)
+	except ValueError as exc:
+		return _json_response({"error": str(exc), "code": "status_change_blocked"}, 409)
 	finally:
 		db.close()
 

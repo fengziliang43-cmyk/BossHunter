@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
+from bosshunter.ai.prefilter import salary_filter_result
 from bosshunter.browser import close_tab, evaluate, navigate as browser_navigate, new_tab, scroll, wait_for_load
 from bosshunter.collection.base import CollectionError, CollectorHooks
 from bosshunter.collection.models import JobCandidate, PlatformCollectionRequest, PlatformCollectionResult
@@ -282,18 +283,27 @@ class LiepinCollector:
         return False
 
     def _passes_filters(self, candidate: JobCandidate) -> bool:
-        """collector 增值过滤：deal_breakers / blocked_company / 实习 / 薪资。"""
+        return not self._filter_reason(candidate)
+
+    def _filter_reason(self, candidate: JobCandidate) -> str:
+        """collector 增值过滤：deal_breakers / blocked_company / 实习（薪资见 _salary_block_reason）。"""
         profile = self.config.get("profile", {}) if isinstance(self.config.get("profile"), dict) else {}
-        if matching_deal_breaker(candidate.title, profile.get("deal_breakers") or []):
-            return False
-        if matching_blocked_company(candidate.company, profile.get("blocked_companies") or []):
-            return False
-        if matching_deal_breaker(candidate.jd, profile.get("jd_deal_breakers") or []):
-            return False
+        if matched := matching_deal_breaker(candidate.title, profile.get("deal_breakers") or []):
+            return f"职位名命中排除词：{matched}"
+        if matched := matching_blocked_company(candidate.company, profile.get("blocked_companies") or []):
+            return f"公司命中屏蔽规则：{matched}"
+        if matched := matching_deal_breaker(candidate.jd, profile.get("jd_deal_breakers") or []):
+            return f"JD 命中排除词：{matched}"
         allow_internship = bool(profile.get("allow_internship", False))
         if not allow_internship and _is_internship(candidate.title):
-            return False
-        return True
+            return "当前设置不接受实习岗位"
+        return ""
+
+    def _salary_block_reason(self, candidate: JobCandidate) -> str | None:
+        """薪资硬过滤（与 quick_score 同规则）；返回拦截原因，None 表示通过。"""
+        profile = self.config.get("profile", {}) if isinstance(self.config.get("profile"), dict) else {}
+        score, reason = salary_filter_result(candidate.salary, profile)
+        return None if score > 0 else reason
 
     def _resume_ttl_hours(self) -> int:
         """断点续采有效期（默认 24h），与 51job 同规则。"""
@@ -402,7 +412,13 @@ class LiepinCollector:
                             candidate = self._candidate_from_list(raw_item, city, keyword)
                             if candidate is None:
                                 continue
-                            if not self._passes_filters(candidate):
+                            salary_reason = self._salary_block_reason(candidate)
+                            if salary_reason:
+                                hooks.on_event(message=f"猎聘 列表预筛：{salary_reason}", increment_filtered=True, filtered_candidate=candidate)
+                                continue
+                            filter_reason = self._filter_reason(candidate)
+                            if filter_reason:
+                                hooks.on_event(message=filter_reason, increment_filtered=True, filtered_candidate=candidate)
                                 continue
                             if not hooks.on_list_candidate(candidate):
                                 continue
